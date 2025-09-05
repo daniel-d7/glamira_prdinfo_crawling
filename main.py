@@ -10,36 +10,115 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from urllib.parse import urljoin
 from typing import Tuple, Optional
+from dotenv import load_dotenv
+import threading
+
+# Load environment variables
+load_dotenv()
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/scraping.log'),
-        logging.StreamHandler()
-    ]
-)
+def setup_logging():
+    """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/scraping.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+# Initialize logging
+setup_logging()
 logger = logging.getLogger(__name__)
 
 class GlamiraScraper:
     def __init__(self, domains_file: str, products_file: str, output_dir: str):
-        self.domains_file = domains_file
-        self.products_file = products_file
-        self.output_dir = output_dir
-        self.db_path = "checkpoint.db"
+        try:
+            self.domains_file = domains_file
+            self.products_file = products_file
+            self.output_dir = output_dir
+            self.db_path = "checkpoint.db"
+            
+            # Create output directory if it doesn't exist
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Initialize database
+            self.init_database()
+            
+            # Load data
+            logger.info("Loading CSV data...")
+            self.domains_df = pd.read_csv(self.domains_file)
+            self.products_df = pd.read_csv(self.products_file)
+            
+            # Load proxy configurations
+            logger.info("Loading proxy configurations...")
+            self.proxy_configs = self.load_proxy_configs()
+            
+            # Thread-local storage for worker-specific proxy assignment
+            self.thread_local = threading.local()
+            
+            logger.info(f"Loaded {len(self.domains_df)} domains and {len(self.products_df)} products")
+            logger.info(f"Loaded {len(self.proxy_configs)} proxy configurations")
+            
+        except Exception as e:
+            logger.error(f"Error initializing scraper: {e}")
+            raise
+    
+    def load_proxy_configs(self):
+        """Load SOCKS5 proxy configurations from environment variables"""
+        proxy_configs = []
         
-        # Create output directory if it doesn't exist
-        os.makedirs(self.output_dir, exist_ok=True)
+        for i in range(1, 4):  # Load proxies 1, 2, 3
+            ip = os.getenv(f'ip{i}')
+            port = os.getenv(f'port{i}')
+            user = os.getenv(f'user{i}')
+            passwd = os.getenv(f'passwd{i}')
+            
+            if ip and port:
+                config = {
+                    'ip': ip,
+                    'port': int(port),
+                    'user': user,
+                    'passwd': passwd,
+                    'proxy_id': i
+                }
+                proxy_configs.append(config)
+                logger.info(f"Loaded proxy {i}: {ip}:{port} (user: {user})")
+            else:
+                logger.warning(f"Proxy {i} configuration incomplete or missing")
         
-        # Initialize database
-        self.init_database()
+        if not proxy_configs:
+            logger.warning("No proxy configurations found. Running without proxies.")
         
-        # Load data
-        self.domains_df = pd.read_csv(self.domains_file)
-        self.products_df = pd.read_csv(self.products_file)
+        return proxy_configs
+    
+    def get_worker_proxy(self, worker_id: int):
+        """Get proxy configuration for a specific worker"""
+        if not self.proxy_configs:
+            return None
         
-        logger.info(f"Loaded {len(self.domains_df)} domains and {len(self.products_df)} products")
+        # Assign proxy based on worker ID (cyclically if needed)
+        proxy_index = (worker_id - 1) % len(self.proxy_configs)
+        return self.proxy_configs[proxy_index]
+    
+    def create_proxy_session(self, proxy_config):
+        """Create a requests session with SOCKS5 proxy configuration"""
+        session = requests.Session()
+        
+        if proxy_config:
+            proxy_url = f"socks5://{proxy_config['user']}:{proxy_config['passwd']}@{proxy_config['ip']}:{proxy_config['port']}"
+            proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            session.proxies.update(proxies)
+            logger.debug(f"Using proxy {proxy_config['proxy_id']}: {proxy_config['ip']}:{proxy_config['port']}")
+        
+        return session
     
     def init_database(self):
         """Initialize SQLite database for checkpoints"""
@@ -231,21 +310,31 @@ class GlamiraScraper:
         return None
     
     def fetch_product_data(self, domain: str, product_id: str) -> Tuple[bool, Optional[dict]]:
-        """Fetch product data with retries for 403 errors"""
+        """Fetch product data with retries for 403 errors and SOCKS5 proxy support"""
+        # Get current worker ID from thread-local storage
+        worker_id = getattr(self.thread_local, 'worker_id', 1)
+        proxy_config = self.get_worker_proxy(worker_id)
+        
         url = f"https://{domain}/catalog/product/view/id/{product_id}"
         
-        # Rotate user agents
+        # Rotate user agents - Updated with modern, less detectable agents
         user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/91.0.864.59'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0'
         ]
         
         for attempt in range(5):  # Retry up to 5 times
             try:
-                # Use a different session for each attempt
-                session = requests.Session()
+                # Create session with proxy configuration
+                session = self.create_proxy_session(proxy_config)
                 
                 # Rotate user agent
                 ua = user_agents[attempt % len(user_agents)]
@@ -268,31 +357,32 @@ class GlamiraScraper:
                 if attempt > 0:
                     session.headers['Referer'] = f"https://{domain}/"
                 
-                logger.info(f"Fetching {url} (attempt {attempt + 1}/5) with UA: {ua[:50]}...")
+                proxy_info = f" (proxy {proxy_config['proxy_id']}: {proxy_config['ip']}:{proxy_config['port']})" if proxy_config else " (no proxy)"
+                logger.info(f"Worker {worker_id}: Fetching {url} (attempt {attempt + 1}/5) with UA: {ua[:50]}...{proxy_info}")
                 
                 # Add random delay between attempts
                 if attempt > 0:
                     delay = (2 ** attempt) + (attempt * 2)  # Progressive delay
-                    logger.info(f"Waiting {delay} seconds before retry...")
+                    logger.info(f"Worker {worker_id}: Waiting {delay} seconds before retry...")
                     time.sleep(delay)
                 
                 # Use a reasonable timeout
                 response = session.get(url, timeout=20, allow_redirects=True)
                 
-                logger.info(f"Response: {response.status_code} for {url}")
+                logger.info(f"Worker {worker_id}: Response: {response.status_code} for {url}")
                 
                 if response.status_code == 200:
-                    logger.info(f"Successfully fetched {url}")
+                    logger.info(f"Worker {worker_id}: Successfully fetched {url}")
                     
                     # Wait 3 seconds for page to load
                     time.sleep(3)
                     
                     react_data = self.extract_react_data(response.text)
                     if react_data:
-                        logger.info(f"Found react_data for {url}")
+                        logger.info(f"Worker {worker_id}: Found react_data for {url}")
                         return True, react_data
                     else:
-                        logger.warning(f"No react_data found for {url}")
+                        logger.warning(f"Worker {worker_id}: No react_data found for {url}")
                         # Still save the page content for debugging if needed
                         return True, {
                             "url": url,
@@ -305,12 +395,12 @@ class GlamiraScraper:
                         }
                 
                 elif response.status_code == 403:
-                    logger.warning(f"Got 403 for {url}, attempt {attempt + 1}/5")
+                    logger.warning(f"Worker {worker_id}: Got 403 for {url}, attempt {attempt + 1}/5")
                     # Don't give up immediately on 403, continue with next attempt
                     continue
                 
                 elif response.status_code == 404:
-                    logger.warning(f"Product not found (404) for {url}")
+                    logger.warning(f"Worker {worker_id}: Product not found (404) for {url}")
                     return True, {
                         "url": url,
                         "domain": domain,
@@ -320,32 +410,32 @@ class GlamiraScraper:
                     }
                 
                 elif response.status_code in [429, 503]:  # Rate limited or service unavailable
-                    logger.warning(f"Rate limited ({response.status_code}) for {url}")
+                    logger.warning(f"Worker {worker_id}: Rate limited ({response.status_code}) for {url}")
                     if attempt < 4:
                         delay = (2 ** attempt) * 5  # Longer delay for rate limiting
-                        logger.info(f"Rate limited, waiting {delay} seconds...")
+                        logger.info(f"Worker {worker_id}: Rate limited, waiting {delay} seconds...")
                         time.sleep(delay)
                     continue
                 
                 else:
-                    logger.error(f"HTTP {response.status_code} for {url}")
+                    logger.error(f"Worker {worker_id}: HTTP {response.status_code} for {url}")
                     if attempt < 4:
                         time.sleep(3)
                     continue
                     
             except requests.exceptions.Timeout:
-                logger.warning(f"Timeout for {url}, attempt {attempt + 1}/5")
+                logger.warning(f"Worker {worker_id}: Timeout for {url}, attempt {attempt + 1}/5")
                 if attempt < 4:
                     time.sleep(5)
                 continue
                 
             except requests.exceptions.RequestException as e:
-                logger.error(f"Request error for {url}: {e}")
+                logger.error(f"Worker {worker_id}: Request error for {url}: {e}")
                 if attempt < 4:
                     time.sleep(3)
                 continue
         
-        logger.error(f"Failed to fetch {url} after 5 attempts")
+        logger.error(f"Worker {worker_id}: Failed to fetch {url} after 5 attempts")
         return False, {
             "url": url,
             "domain": domain,
@@ -369,13 +459,66 @@ class GlamiraScraper:
         filepath = os.path.join(self.output_dir, filename)
         
         try:
+            # Ensure output directory exists
+            os.makedirs(self.output_dir, exist_ok=True)
+            
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved data to {filepath}")
+            
+            # Verify file was created
+            if os.path.exists(filepath):
+                file_size = os.path.getsize(filepath)
+                logger.info(f"✓ Saved data to {filepath} ({file_size} bytes)")
+            else:
+                logger.error(f"❌ File was not created: {filepath}")
+                
         except Exception as e:
-            logger.error(f"Error saving {filepath}: {e}")
+            logger.error(f"❌ Error saving {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
+    def process_product_with_worker_id(self, domain: str, product_id: str, worker_id: int) -> bool:
+        """Process a single domain-product combination with worker ID assignment"""
+        # Set worker ID in thread-local storage
+        self.thread_local.worker_id = worker_id
+        
+        try:
+            # Check if already processed
+            if self.is_processed(domain, product_id):
+                logger.info(f"Worker {worker_id}: Skipping {domain}/{product_id} - already processed")
+                return True
+            
+            logger.info(f"Worker {worker_id}: Processing {domain}/{product_id}")
+            
+            # Fetch data
+            success, data = self.fetch_product_data(domain, product_id)
+            
+            logger.info(f"Worker {worker_id}: Fetch result for {domain}/{product_id} - Success: {success}, Data: {type(data)}")
+            
+            if success and data:
+                logger.info(f"Worker {worker_id}: Saving data for {domain}/{product_id}")
+                
+                # Save data
+                self.save_product_data(domain, product_id, data)
+                
+                # Save checkpoint
+                self.save_checkpoint(domain, product_id, 'success')
+                logger.info(f"Worker {worker_id}: ✓ Successfully processed {domain}/{product_id}")
+                return True
+            else:
+                # Save failed checkpoint
+                self.save_checkpoint(domain, product_id, 'failed')
+                logger.error(f"Worker {worker_id}: ❌ Failed to process {domain}/{product_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Worker {worker_id}: ❌ Error processing {domain}/{product_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            self.save_checkpoint(domain, product_id, 'error')
+            return False
+
     def process_product(self, domain: str, product_id: str) -> bool:
         """Process a single domain-product combination"""
         try:
@@ -407,7 +550,7 @@ class GlamiraScraper:
             return False
     
     def run_scraping(self, max_workers: int = 3):
-        """Run the scraping process with concurrent workers"""
+        """Run the scraping process with concurrent workers and proxy assignment"""
         tasks = []
         
         # Create all domain-product combinations
@@ -418,20 +561,26 @@ class GlamiraScraper:
                 tasks.append((domain, product_id))
         
         logger.info(f"Starting scraping with {max_workers} workers for {len(tasks)} tasks")
+        logger.info(f"Proxy configurations available: {len(self.proxy_configs)}")
         
         completed = 0
         failed = 0
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_task = {
-                executor.submit(self.process_product, domain, product_id): (domain, product_id)
-                for domain, product_id in tasks
-            }
+            # Submit all tasks with worker ID assignment
+            future_to_task = {}
+            worker_id = 1
+            
+            for domain, product_id in tasks:
+                future = executor.submit(self.process_product_with_worker_id, domain, product_id, worker_id)
+                future_to_task[future] = (domain, product_id, worker_id)
+                
+                # Cycle through worker IDs
+                worker_id = (worker_id % max_workers) + 1
             
             # Process completed tasks
             for future in as_completed(future_to_task):
-                domain, product_id = future_to_task[future]
+                domain, product_id, assigned_worker_id = future_to_task[future]
                 try:
                     success = future.result()
                     if success:
@@ -439,7 +588,7 @@ class GlamiraScraper:
                     else:
                         failed += 1
                 except Exception as e:
-                    logger.error(f"Task {domain}/{product_id} generated an exception: {e}")
+                    logger.error(f"Worker {assigned_worker_id}: Task {domain}/{product_id} generated an exception: {e}")
                     failed += 1
                 
                 if (completed + failed) % 100 == 0:
@@ -463,7 +612,7 @@ def main():
     # Configuration
     domains_file = "data/input_data/domains_cleaned.csv"
     products_file = "data/input_data/node1.csv"
-    output_dir = "data/scraped/output"
+    output_dir = "data/scraped"
     max_workers = 3
     
     # Initialize scraper
